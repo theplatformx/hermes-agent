@@ -148,18 +148,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
-        self._delivery_queue: Optional[asyncio.Queue] = None
-        self._delivery_workers: List[asyncio.Task] = []
-        self._delivery_rate_lock: Optional[asyncio.Lock] = None
-        self._delivery_last_send_ts: float = 0.0
-        self._delivery_consecutive_pool_timeouts: int = 0
-        self._delivery_pool_timeout_count: int = 0
-        self._delivery_last_successful_send_at: Optional[float] = None
-        self._delivery_last_error: Optional[str] = None
-        self._delivery_worker_count = max(1, int(os.getenv("HERMES_TELEGRAM_SEND_WORKERS", "2") or "2"))
-        self._delivery_queue_maxsize = max(1, int(os.getenv("HERMES_TELEGRAM_SEND_QUEUE_MAX", "200") or "200"))
-        self._delivery_min_interval = max(0.0, float(os.getenv("HERMES_TELEGRAM_SEND_MIN_INTERVAL_SECONDS", "0.05") or "0.05"))
-        self._delivery_pool_timeout_threshold = max(1, int(os.getenv("HERMES_TELEGRAM_POOL_TIMEOUT_RECOVERY_THRESHOLD", "3") or "3"))
+        self._init_delivery_state()
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
         # DM Topics config from extra.dm_topics
@@ -761,7 +750,24 @@ class TelegramAdapter(BasePlatformAdapter):
         text = str(error or "").lower()
         return "pool timeout" in text or "connection pool" in text
 
+    def _init_delivery_state(self) -> None:
+        if hasattr(self, "_delivery_queue"):
+            return
+        self._delivery_queue: Optional[asyncio.Queue] = None
+        self._delivery_workers: List[asyncio.Task] = []
+        self._delivery_rate_lock: Optional[asyncio.Lock] = None
+        self._delivery_last_send_ts: float = 0.0
+        self._delivery_consecutive_pool_timeouts: int = 0
+        self._delivery_pool_timeout_count: int = 0
+        self._delivery_last_successful_send_at: Optional[float] = None
+        self._delivery_last_error: Optional[str] = None
+        self._delivery_worker_count = max(1, int(os.getenv("HERMES_TELEGRAM_SEND_WORKERS", "2") or "2"))
+        self._delivery_queue_maxsize = max(1, int(os.getenv("HERMES_TELEGRAM_SEND_QUEUE_MAX", "200") or "200"))
+        self._delivery_min_interval = max(0.0, float(os.getenv("HERMES_TELEGRAM_SEND_MIN_INTERVAL_SECONDS", "0.05") or "0.05"))
+        self._delivery_pool_timeout_threshold = max(1, int(os.getenv("HERMES_TELEGRAM_POOL_TIMEOUT_RECOVERY_THRESHOLD", "3") or "3"))
+
     async def _ensure_delivery_workers(self) -> None:
+        self._init_delivery_state()
         if self._delivery_queue is not None:
             return
         self._delivery_queue = asyncio.Queue(maxsize=self._delivery_queue_maxsize)
@@ -779,6 +785,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
     async def _stop_delivery_workers(self) -> None:
+        self._init_delivery_state()
         workers = list(self._delivery_workers)
         self._delivery_workers = []
         for task in workers:
@@ -857,6 +864,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return await future
 
     def _last_delivery_error(self, error: Any, *, degraded_code: str) -> None:
+        self._init_delivery_state()
         err = str(error or "unknown Telegram delivery error")
         self._delivery_last_error = err
         try:
@@ -872,6 +880,7 @@ class TelegramAdapter(BasePlatformAdapter):
             pass
 
     def _record_delivery_success(self) -> None:
+        self._init_delivery_state()
         self._delivery_consecutive_pool_timeouts = 0
         self._delivery_last_error = None
         self._delivery_last_successful_send_at = time.time()
@@ -888,6 +897,7 @@ class TelegramAdapter(BasePlatformAdapter):
             pass
 
     def _record_delivery_failure(self, error: Any) -> None:
+        self._init_delivery_state()
         if not self._is_pool_timeout_error(error):
             self._last_delivery_error(error, degraded_code="telegram_delivery_error")
             return
@@ -915,6 +925,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 pass
 
     def delivery_health(self) -> Dict[str, Any]:
+        self._init_delivery_state()
         queue = self._delivery_queue
         return {
             "queue_depth": queue.qsize() if queue is not None else 0,
