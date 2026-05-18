@@ -20,3 +20,22 @@ def test_runtime_health_lines_include_fatal_platform_and_startup_reason(monkeypa
 
     assert "⚠ telegram: another poller is active" in lines
     assert "⚠ Last startup issue: telegram conflict" in lines
+
+
+def test_runtime_health_lines_include_degraded_platform(monkeypatch):
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {
+            "gateway_state": "running",
+            "platforms": {
+                "telegram": {
+                    "state": "degraded",
+                    "error_message": "Pool timeout",
+                }
+            },
+        },
+    )
+
+    lines = _runtime_health_lines()
+
+    assert "⚠ telegram: Pool timeout" in lines
