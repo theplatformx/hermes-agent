@@ -192,6 +192,7 @@ def write_runtime_status(
     platform_state: Optional[str] = None,
     error_code: Optional[str] = None,
     error_message: Optional[str] = None,
+    platform_details: Optional[dict[str, Any]] = None,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -215,6 +216,8 @@ def write_runtime_status(
             platform_payload["error_code"] = error_code
         if error_message is not None:
             platform_payload["error_message"] = error_message
+        if platform_details is not None:
+            platform_payload["details"] = platform_details
         platform_payload["updated_at"] = _utc_now_iso()
         payload["platforms"][platform] = platform_payload
 
