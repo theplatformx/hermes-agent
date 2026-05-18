@@ -16,4 +16,4 @@ jobs:
       - name: Compile changed gateway modules
         run: uv run python -m py_compile gateway/platforms/telegram.py gateway/run.py gateway/status.py hermes_cli/gateway.py
       - name: Run targeted Telegram gateway tests
-        run: uv run pytest tests/gateway/test_telegram_delivery_gateway.py tests/hermes_cli/test_gateway_runtime_health.py -q
+        run: uv run --extra dev pytest tests/gateway/test_telegram_delivery_gateway.py tests/hermes_cli/test_gateway_runtime_health.py -q
