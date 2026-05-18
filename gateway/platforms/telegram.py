@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        self._init_delivery_state()
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
         # DM Topics config from extra.dm_topics
@@ -716,6 +718,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 task.cancel()
         self._pending_photo_batch_tasks.clear()
         self._pending_photo_batches.clear()
+        await self._stop_delivery_workers()
 
         self._mark_disconnected()
         self._app = None
@@ -742,6 +745,197 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         else:  # "first" (default)
             return chunk_index == 0
+
+    def _is_pool_timeout_error(self, error: Any) -> bool:
+        text = str(error or "").lower()
+        return "pool timeout" in text or "connection pool" in text
+
+    def _init_delivery_state(self) -> None:
+        if hasattr(self, "_delivery_queue"):
+            return
+        self._delivery_queue: Optional[asyncio.Queue] = None
+        self._delivery_workers: List[asyncio.Task] = []
+        self._delivery_rate_lock: Optional[asyncio.Lock] = None
+        self._delivery_last_send_ts: float = 0.0
+        self._delivery_consecutive_pool_timeouts: int = 0
+        self._delivery_pool_timeout_count: int = 0
+        self._delivery_last_successful_send_at: Optional[float] = None
+        self._delivery_last_error: Optional[str] = None
+        self._delivery_worker_count = max(1, int(os.getenv("HERMES_TELEGRAM_SEND_WORKERS", "2") or "2"))
+        self._delivery_queue_maxsize = max(1, int(os.getenv("HERMES_TELEGRAM_SEND_QUEUE_MAX", "200") or "200"))
+        self._delivery_min_interval = max(0.0, float(os.getenv("HERMES_TELEGRAM_SEND_MIN_INTERVAL_SECONDS", "0.05") or "0.05"))
+        self._delivery_pool_timeout_threshold = max(1, int(os.getenv("HERMES_TELEGRAM_POOL_TIMEOUT_RECOVERY_THRESHOLD", "3") or "3"))
+
+    async def _ensure_delivery_workers(self) -> None:
+        self._init_delivery_state()
+        if self._delivery_queue is not None:
+            return
+        self._delivery_queue = asyncio.Queue(maxsize=self._delivery_queue_maxsize)
+        self._delivery_rate_lock = asyncio.Lock()
+        self._delivery_workers = [
+            asyncio.create_task(self._delivery_worker(index), name=f"telegram-send-{index}")
+            for index in range(self._delivery_worker_count)
+        ]
+        logger.info(
+            "[%s] Telegram delivery queue started: workers=%d maxsize=%d min_interval=%.3fs",
+            self.name,
+            self._delivery_worker_count,
+            self._delivery_queue_maxsize,
+            self._delivery_min_interval,
+        )
+
+    async def _stop_delivery_workers(self) -> None:
+        self._init_delivery_state()
+        workers = list(self._delivery_workers)
+        self._delivery_workers = []
+        for task in workers:
+            if not task.done():
+                task.cancel()
+        for task in workers:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.debug("[%s] Telegram delivery worker shutdown failed: %s", self.name, exc)
+        queue = self._delivery_queue
+        if queue is not None:
+            while True:
+                try:
+                    _method_name, _args, _kwargs, future = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not future.done():
+                    future.set_exception(RuntimeError("Telegram adapter shutting down"))
+                queue.task_done()
+        self._delivery_queue = None
+
+    async def _delivery_worker(self, worker_id: int) -> None:
+        while True:
+            method_name, args, kwargs, future = await self._delivery_queue.get()
+            try:
+                await self._telegram_rate_gate()
+                if not self._bot:
+                    raise RuntimeError("Telegram bot is not connected")
+                method = getattr(self._bot, method_name)
+                result = await method(*args, **kwargs)
+                self._record_delivery_success()
+                if not future.done():
+                    future.set_result(result)
+            except asyncio.CancelledError:
+                if not future.done():
+                    future.set_exception(RuntimeError("Telegram delivery worker cancelled"))
+                raise
+            except Exception as exc:
+                self._record_delivery_failure(exc)
+                if not future.done():
+                    future.set_exception(exc)
+            finally:
+                self._delivery_queue.task_done()
+
+    async def _telegram_rate_gate(self) -> None:
+        lock = self._delivery_rate_lock
+        if lock is None:
+            return
+        async with lock:
+            if self._delivery_min_interval > 0:
+                now = asyncio.get_running_loop().time()
+                wait = self._delivery_min_interval - (now - self._delivery_last_send_ts)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+            self._delivery_last_send_ts = asyncio.get_running_loop().time()
+
+    async def _telegram_api_call(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        """Run every outbound Telegram Bot API call through one bounded queue."""
+        await self._ensure_delivery_workers()
+        if self._delivery_queue is None:
+            if not self._bot:
+                raise RuntimeError("Telegram bot is not connected")
+            return await getattr(self._bot, method_name)(*args, **kwargs)
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        try:
+            self._delivery_queue.put_nowait((method_name, args, kwargs, future))
+        except asyncio.QueueFull as exc:
+            error = f"Telegram outbound queue full ({self._delivery_queue.qsize()}/{self._delivery_queue_maxsize})"
+            self._last_delivery_error(error, degraded_code="telegram_delivery_queue_full")
+            raise RuntimeError(error) from exc
+        return await future
+
+    def _last_delivery_error(self, error: Any, *, degraded_code: str) -> None:
+        self._init_delivery_state()
+        err = str(error or "unknown Telegram delivery error")
+        self._delivery_last_error = err
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(
+                platform=self.platform.value,
+                platform_state="degraded",
+                error_code=degraded_code,
+                error_message=err[:300],
+                platform_details=self.delivery_health(),
+            )
+        except Exception:
+            pass
+
+    def _record_delivery_success(self) -> None:
+        self._init_delivery_state()
+        self._delivery_consecutive_pool_timeouts = 0
+        self._delivery_last_error = None
+        self._delivery_last_successful_send_at = time.time()
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(
+                platform=self.platform.value,
+                platform_state="connected",
+                error_code=None,
+                error_message=None,
+                platform_details=self.delivery_health(),
+            )
+        except Exception:
+            pass
+
+    def _record_delivery_failure(self, error: Any) -> None:
+        self._init_delivery_state()
+        if not self._is_pool_timeout_error(error):
+            self._last_delivery_error(error, degraded_code="telegram_delivery_error")
+            return
+
+        self._delivery_pool_timeout_count += 1
+        self._delivery_consecutive_pool_timeouts += 1
+        self._last_delivery_error(error, degraded_code="telegram_pool_timeout")
+        logger.warning(
+            "[%s] Telegram PoolTimeout (%d consecutive, queue=%d/%d): %s",
+            self.name,
+            self._delivery_consecutive_pool_timeouts,
+            self._delivery_queue.qsize() if self._delivery_queue else 0,
+            self._delivery_queue_maxsize,
+            error,
+        )
+        if self._delivery_consecutive_pool_timeouts >= self._delivery_pool_timeout_threshold:
+            message = (
+                "Repeated Telegram outbound PoolTimeouts; gateway supervisor "
+                "must recycle the Telegram adapter/client."
+            )
+            self._set_fatal_error("telegram_pool_timeout", message, retryable=True)
+            try:
+                asyncio.create_task(self._notify_fatal_error())
+            except RuntimeError:
+                pass
+
+    def delivery_health(self) -> Dict[str, Any]:
+        self._init_delivery_state()
+        queue = self._delivery_queue
+        return {
+            "queue_depth": queue.qsize() if queue is not None else 0,
+            "queue_maxsize": self._delivery_queue_maxsize,
+            "workers": len([task for task in self._delivery_workers if not task.done()]),
+            "consecutive_pool_timeouts": self._delivery_consecutive_pool_timeouts,
+            "pool_timeout_count": self._delivery_pool_timeout_count,
+            "last_successful_send_at": self._delivery_last_successful_send_at,
+            "last_error": self._delivery_last_error,
+        }
 
     async def send(
         self,
@@ -799,7 +993,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     try:
                         # Try Markdown first, fall back to plain text if it fails
                         try:
-                            msg = await self._bot.send_message(
+                            msg = await self._telegram_api_call(
+                                "send_message",
                                 chat_id=int(chat_id),
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
@@ -811,7 +1006,8 @@ class TelegramAdapter(BasePlatformAdapter):
                             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
                                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                                 plain_chunk = _strip_mdv2(chunk)
-                                msg = await self._bot.send_message(
+                                msg = await self._telegram_api_call(
+                                    "send_message",
                                     chat_id=int(chat_id),
                                     text=plain_chunk,
                                     parse_mode=None,
@@ -906,7 +1102,8 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             formatted = self.format_message(content)
             try:
-                await self._bot.edit_message_text(
+                await self._telegram_api_call(
+                    "edit_message_text",
                     chat_id=int(chat_id),
                     message_id=int(message_id),
                     text=formatted,
@@ -917,7 +1114,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 if "not modified" in str(fmt_err).lower():
                     return SendResult(success=True, message_id=message_id)
                 # Fallback: retry without markdown formatting
-                await self._bot.edit_message_text(
+                await self._telegram_api_call(
+                    "edit_message_text",
                     chat_id=int(chat_id),
                     message_id=int(message_id),
                     text=content,
@@ -934,7 +1132,8 @@ class TelegramAdapter(BasePlatformAdapter):
             if "message_too_long" in err_str or "too long" in err_str:
                 truncated = content[: self.MAX_MESSAGE_LENGTH - 20] + "…"
                 try:
-                    await self._bot.edit_message_text(
+                    await self._telegram_api_call(
+                        "edit_message_text",
                         chat_id=int(chat_id),
                         message_id=int(message_id),
                         text=truncated,
@@ -956,7 +1155,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=f"flood_control:{wait}")
                 await asyncio.sleep(wait)
                 try:
-                    await self._bot.edit_message_text(
+                    await self._telegram_api_call(
+                        "edit_message_text",
                         chat_id=int(chat_id),
                         message_id=int(message_id),
                         text=content,
@@ -997,7 +1197,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     InlineKeyboardButton("✗ No", callback_data="update_prompt:n"),
                 ]
             ])
-            msg = await self._bot.send_message(
+            msg = await self._telegram_api_call(
+                "send_message",
                 chat_id=int(chat_id),
                 text=text,
                 parse_mode=ParseMode.MARKDOWN,
@@ -1065,7 +1266,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 # .ogg files -> send as voice (round playable bubble)
                 if audio_path.endswith(".ogg") or audio_path.endswith(".opus"):
                     _voice_thread = metadata.get("thread_id") if metadata else None
-                    msg = await self._bot.send_voice(
+                    msg = await self._telegram_api_call(
+                        "send_voice",
                         chat_id=int(chat_id),
                         voice=audio_file,
                         caption=caption[:1024] if caption else None,
@@ -1075,7 +1277,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 else:
                     # .mp3 and others -> send as audio file
                     _audio_thread = metadata.get("thread_id") if metadata else None
-                    msg = await self._bot.send_audio(
+                    msg = await self._telegram_api_call(
+                        "send_audio",
                         chat_id=int(chat_id),
                         audio=audio_file,
                         caption=caption[:1024] if caption else None,
@@ -1112,7 +1315,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
             _thread = metadata.get("thread_id") if metadata else None
             with open(image_path, "rb") as image_file:
-                msg = await self._bot.send_photo(
+                msg = await self._telegram_api_call(
+                    "send_photo",
                     chat_id=int(chat_id),
                     photo=image_file,
                     caption=caption[:1024] if caption else None,
@@ -1151,7 +1355,8 @@ class TelegramAdapter(BasePlatformAdapter):
             _thread = metadata.get("thread_id") if metadata else None
 
             with open(file_path, "rb") as f:
-                msg = await self._bot.send_document(
+                msg = await self._telegram_api_call(
+                    "send_document",
                     chat_id=int(chat_id),
                     document=f,
                     filename=display_name,
@@ -1183,7 +1388,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
             _thread = metadata.get("thread_id") if metadata else None
             with open(video_path, "rb") as f:
-                msg = await self._bot.send_video(
+                msg = await self._telegram_api_call(
+                    "send_video",
                     chat_id=int(chat_id),
                     video=f,
                     caption=caption[:1024] if caption else None,
@@ -1214,7 +1420,8 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # Telegram can send photos directly from URLs (up to ~5MB)
             _photo_thread = metadata.get("thread_id") if metadata else None
-            msg = await self._bot.send_photo(
+            msg = await self._telegram_api_call(
+                "send_photo",
                 chat_id=int(chat_id),
                 photo=image_url,
                 caption=caption[:1024] if caption else None,  # Telegram caption limit
@@ -1237,7 +1444,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     resp.raise_for_status()
                     image_data = resp.content
                 
-                msg = await self._bot.send_photo(
+                msg = await self._telegram_api_call(
+                    "send_photo",
                     chat_id=int(chat_id),
                     photo=image_data,
                     caption=caption[:1024] if caption else None,
@@ -1268,7 +1476,8 @@ class TelegramAdapter(BasePlatformAdapter):
         
         try:
             _anim_thread = metadata.get("thread_id") if metadata else None
-            msg = await self._bot.send_animation(
+            msg = await self._telegram_api_call(
+                "send_animation",
                 chat_id=int(chat_id),
                 animation=animation_url,
                 caption=caption[:1024] if caption else None,
@@ -1291,7 +1500,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._bot:
             try:
                 _typing_thread = metadata.get("thread_id") if metadata else None
-                await self._bot.send_chat_action(
+                await self._telegram_api_call(
+                    "send_chat_action",
                     chat_id=int(chat_id),
                     action="typing",
                     message_thread_id=int(_typing_thread) if _typing_thread else None,

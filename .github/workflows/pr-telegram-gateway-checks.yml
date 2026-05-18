@@ -1,0 +1,19 @@
+name: PR Telegram Gateway Checks
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  telegram-gateway-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install Python
+        run: uv python install 3.13
+      - name: Compile changed gateway modules
+        run: uv run python -m py_compile gateway/platforms/telegram.py gateway/run.py gateway/status.py hermes_cli/gateway.py
+      - name: Run targeted Telegram gateway tests
+        run: uv run --extra dev pytest tests/gateway/test_telegram_delivery_gateway.py tests/hermes_cli/test_gateway_runtime_health.py -q

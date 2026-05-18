@@ -1615,6 +1615,9 @@ def _runtime_health_lines() -> list[str]:
         if pdata.get("state") == "fatal":
             message = pdata.get("error_message") or "unknown error"
             lines.append(f"⚠ {platform}: {message}")
+        elif pdata.get("state") == "degraded":
+            message = pdata.get("error_message") or pdata.get("error_code") or "degraded"
+            lines.append(f"⚠ {platform}: {message}")
 
     if gateway_state == "startup_failed" and exit_reason:
         lines.append(f"⚠ Last startup issue: {exit_reason}")
