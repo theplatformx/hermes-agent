@@ -1839,8 +1839,11 @@ class GatewayRunner:
                 return f"✓ Sent `{label}` to the update process."
 
         # PRIORITY handling when an agent is already running for this session.
-        # Default behavior is to interrupt immediately so user text/stop messages
-        # are handled with minimal latency.
+        # Default behavior is to queue follow-up text FIFO. Chat gateways are
+        # production surfaces; unbounded interrupts can turn one long-running
+        # session into many concurrent progress/fallback sends and wedge
+        # Telegram's outbound PTB/httpx pool. Explicit /stop, /new, /approve,
+        # /deny and /queue keep their command-specific behavior below.
         #
         # Special case: Telegram/photo bursts often arrive as multiple near-
         # simultaneous updates. Do NOT interrupt for photo-only follow-ups here;
@@ -2003,12 +2006,14 @@ class GatewayRunner:
                 if adapter:
                     adapter._pending_messages[_quick_key] = event
                 return None
-            logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
-            running_agent.interrupt(event.text)
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                adapter._pending_messages[_quick_key] = event
             if _quick_key in self._pending_messages:
                 self._pending_messages[_quick_key] += "\n" + event.text
             else:
                 self._pending_messages[_quick_key] = event.text
+            logger.debug("Queued follow-up for active session %s", _quick_key[:20])
             return None
 
         # Check for commands
